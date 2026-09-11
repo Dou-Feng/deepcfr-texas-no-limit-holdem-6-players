@@ -19,11 +19,14 @@ from src.utils.traversal_diagnostics import (
     record_action_values,
 )
 from src.utils.actions import (
+    NUM_ACTIONS_DISCRETE,
+    RAISE_ACTION_MULTIPLIERS,
     action_type_to_pokers_action as map_action_type_to_pokers_action,
     legal_action_types,
 )
 from src.utils.checkpoints import (
     AGENT_TYPE_STANDARD,
+    checkpoint_num_actions,
     load_checkpoint,
     standard_checkpoint_state,
     validate_checkpoint_compatibility,
@@ -188,6 +191,13 @@ def weighted_sample_loss(sample_losses, weights):
     return torch.sum(weights * sample_losses)
 
 
+def _memory_bet_size(agent, action_type, predicted_multiplier):
+    """Return the raise sizing stored in replay memories for a chosen action type."""
+    if agent.num_actions >= NUM_ACTIONS_DISCRETE:
+        return RAISE_ACTION_MULTIPLIERS.get(action_type, 0.0)
+    return predicted_multiplier if action_type in RAISE_ACTION_MULTIPLIERS else 0.0
+
+
 def traverse_agent_turn(
     agent,
     state,
@@ -251,11 +261,19 @@ def traverse_agent_turn(
     for action_type in legal_action_types:
         pokers_action = None
         try:
-            if action_type == 2:
+            if action_type in RAISE_ACTION_MULTIPLIERS:
+                # Discrete abstraction: each raise action type carries a fixed
+                # pot multiplier so CFR assigns it its own regret. The legacy
+                # 3-action abstraction still uses the predicted sizing head.
+                raise_multiplier = (
+                    RAISE_ACTION_MULTIPLIERS[action_type]
+                    if agent.num_actions >= NUM_ACTIONS_DISCRETE
+                    else bet_size_multiplier
+                )
                 pokers_action = agent.action_type_to_pokers_action(
                     action_type,
                     state,
-                    bet_size_multiplier,
+                    raise_multiplier,
                     strict=True,
                 )
             else:
@@ -361,7 +379,7 @@ def traverse_agent_turn(
                 encoded_state,
                 opponent_feature_array,
                 action_type,
-                bet_size_multiplier if action_type == 2 else 0.0,
+                _memory_bet_size(agent, action_type, bet_size_multiplier),
                 weighted_regret,
             ),
             priority,
@@ -376,7 +394,9 @@ def traverse_agent_turn(
             encoded_state,
             opponent_feature_array,
             strategy_full,
-            bet_size_multiplier if 2 in legal_action_types else 0.0,
+            bet_size_multiplier
+            if any(a in RAISE_ACTION_MULTIPLIERS for a in legal_action_types)
+            else 0.0,
             iteration,
         )
     )
@@ -390,8 +410,10 @@ class DeepCFRAgent:
         self.num_players = num_players
         self.device = device
         
-        # Define action types (Fold, Check/Call, Raise)
-        self.num_actions = 3
+        # Define action types (Fold, Check/Call, Raise-half-pot, Raise-pot, Raise-overbet)
+        self.num_actions = NUM_ACTIONS_DISCRETE
+        # Fixed pot multipliers for the discrete raise action types.
+        self.raise_action_multipliers = dict(RAISE_ACTION_MULTIPLIERS)
         
         # Calculate input size based on state encoding
         input_size = 52 + 52 + 5 + 1 + num_players + num_players + num_players*4 + 1 + 4 + 5
@@ -507,7 +529,7 @@ class DeepCFRAgent:
 
     def get_legal_action_types(self, state):
         """Get the legal action types for the current state."""
-        return legal_action_types(state)
+        return legal_action_types(state, num_actions=self.num_actions)
 
     def cfr_traverse(self, state, iteration, random_agents, depth=0):
         """
@@ -688,8 +710,8 @@ class DeepCFRAgent:
                 min_weight = torch.min(weight_tensors).item()
                 print(f"[DEBUG-WEIGHTS] Weight range: min={min_weight:.4f}, max={max_weight:.4f}")
             
-            # Compute bet sizing loss (only for raise actions)
-            raise_mask = (action_type_tensors == 2)
+            # Compute bet sizing loss (only for raise actions, types 2/3/4)
+            raise_mask = (action_type_tensors >= 2)
             if torch.any(raise_mask):
                 # Calculate loss for all bet sizes
                 all_bet_losses = F.smooth_l1_loss(bet_size_preds, bet_size_tensors, reduction='none')
@@ -849,8 +871,8 @@ class DeepCFRAgent:
                 weights,
             )
             
-            # Bet size loss (only for states with raise actions)
-            raise_mask = (strategy_tensors[:, 2] > 0)
+            # Bet size loss (only for states where some raise action was legal)
+            raise_mask = (strategy_tensors[:, 2:].sum(dim=1) > 0)
             if raise_mask.sum() > 0:
                 raise_indices = torch.nonzero(raise_mask).squeeze(1)
                 raise_bet_preds = bet_size_preds[raise_indices]
@@ -914,13 +936,13 @@ class DeepCFRAgent:
         # Choose action based on probabilities
         action_idx = np.random.choice(len(legal_action_types), p=legal_probs)
         action_type = legal_action_types[action_idx]
-        
-        # Use the predicted bet size for raise actions
-        if action_type == 2:  # Raise
+
+        # Discrete raise action types carry fixed pot multipliers
+        if action_type in self.raise_action_multipliers:
             return self.action_type_to_pokers_action(
                 action_type,
                 state,
-                bet_size_multiplier,
+                self.raise_action_multipliers[action_type],
                 strict=settings.is_strict_checking(),
             )
         else:
@@ -942,7 +964,17 @@ class DeepCFRAgent:
             checkpoint,
             expected_agent_type=AGENT_TYPE_STANDARD,
             expected_num_players=self.num_players,
+            expected_num_actions=self.num_actions,
         )
+        checkpoint_actions = checkpoint_num_actions(checkpoint)
+        if checkpoint_actions != self.num_actions:
+            raise ValueError(
+                f"Checkpoint uses a {checkpoint_actions}-action abstraction but this "
+                f"agent uses {self.num_actions} actions (discrete raise sizings: "
+                "half-pot/pot/2x-pot). The advantage/strategy head shapes differ, so "
+                "the checkpoint cannot be loaded directly. Retrain with the new "
+                "abstraction or convert the checkpoint heads first."
+            )
         self.iteration_count = checkpoint['iteration']
         self.advantage_net.load_state_dict(checkpoint['advantage_net'])
         self.strategy_net.load_state_dict(checkpoint['strategy_net'])

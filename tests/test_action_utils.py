@@ -6,6 +6,10 @@ from src.utils.actions import (
     ACTION_TYPE_CHECK_CALL,
     ACTION_TYPE_FOLD,
     ACTION_TYPE_RAISE,
+    ACTION_TYPE_RAISE_HALF_POT,
+    ACTION_TYPE_RAISE_OVERBET,
+    ACTION_TYPE_RAISE_POT,
+    NUM_ACTIONS_DISCRETE,
     action_type_to_pokers_action,
     build_raise_action,
     legal_action_types,
@@ -52,6 +56,62 @@ def test_legal_action_types_collapses_check_call():
         ACTION_TYPE_CHECK_CALL,
         ACTION_TYPE_RAISE,
     ]
+
+
+def test_legal_action_types_expands_discrete_raise_sizings():
+    state = make_state(
+        [
+            pkrs.ActionEnum.Fold,
+            pkrs.ActionEnum.Check,
+            pkrs.ActionEnum.Raise,
+        ]
+    )
+
+    assert legal_action_types(state, num_actions=NUM_ACTIONS_DISCRETE) == [
+        ACTION_TYPE_FOLD,
+        ACTION_TYPE_CHECK_CALL,
+        ACTION_TYPE_RAISE_HALF_POT,
+        ACTION_TYPE_RAISE_POT,
+        ACTION_TYPE_RAISE_OVERBET,
+    ]
+
+
+def test_discrete_raise_action_types_use_fixed_pot_multipliers():
+    state = make_state(
+        [pkrs.ActionEnum.Fold, pkrs.ActionEnum.Call, pkrs.ActionEnum.Raise],
+        min_bet=2.0,
+        current_bet=0.0,
+        stake=100.0,
+        pot=10.0,
+        bb=2.0,
+    )
+
+    half = action_type_to_pokers_action(ACTION_TYPE_RAISE_HALF_POT, state)
+    pot_raise = action_type_to_pokers_action(ACTION_TYPE_RAISE_POT, state)
+    overbet = action_type_to_pokers_action(ACTION_TYPE_RAISE_OVERBET, state)
+
+    assert half.action == pkrs.ActionEnum.Raise
+    assert half.amount == 5.0  # 0.5 * pot
+    assert pot_raise.action == pkrs.ActionEnum.Raise
+    assert pot_raise.amount == 10.0  # 1.0 * pot
+    assert overbet.action == pkrs.ActionEnum.Raise
+    assert overbet.amount == 20.0  # 2.0 * pot
+
+
+def test_overbet_clamps_to_remaining_stake():
+    state = make_state(
+        [pkrs.ActionEnum.Fold, pkrs.ActionEnum.Call, pkrs.ActionEnum.Raise],
+        min_bet=2.0,
+        current_bet=0.0,
+        stake=12.0,
+        pot=10.0,
+        bb=2.0,
+    )
+
+    action = action_type_to_pokers_action(ACTION_TYPE_RAISE_OVERBET, state)
+
+    assert action.action == pkrs.ActionEnum.Raise
+    assert action.amount == 10.0  # max additional raise with 12 stake and 2 to call
 
 
 def test_build_raise_action_clamps_to_remaining_stake():

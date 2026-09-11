@@ -10,6 +10,16 @@ from src.utils.actions import sanitize_action
 from src.utils.logging import apply_action_with_logging
 
 
+def classify_raise_size(amount: float, pot: float) -> str:
+    """Bucket a raise amount (additional chips) into the discrete sizings."""
+    ratio = float(amount) / max(1.0, float(pot))
+    if ratio <= 0.75:
+        return "half_pot"
+    if ratio <= 1.5:
+        return "pot"
+    return "overbet"
+
+
 def action_history_id(action: pkrs.Action, pot: float) -> int:
     """Map a pokers action to the compact opponent-modeling history id."""
     if action.action == pkrs.ActionEnum.Fold:
@@ -58,9 +68,15 @@ def empty_evaluation_metrics(requested_games: int) -> Dict[str, Any]:
         "agent_fold_actions": 0,
         "agent_check_call_actions": 0,
         "agent_raise_actions": 0,
+        "agent_raise_half_pot_actions": 0,
+        "agent_raise_pot_actions": 0,
+        "agent_raise_overbet_actions": 0,
         "agent_fold_rate": 0.0,
         "agent_check_call_rate": 0.0,
         "agent_raise_rate": 0.0,
+        "agent_raise_half_pot_rate": 0.0,
+        "agent_raise_pot_rate": 0.0,
+        "agent_raise_overbet_rate": 0.0,
         "agent_preflop_actions": 0,
         "agent_preflop_folds": 0,
         "agent_preflop_fold_rate": 0.0,
@@ -88,6 +104,13 @@ def write_evaluation_diagnostics(writer, metrics: Dict[str, Any], iteration: int
     writer.add_scalar(f"{prefix}/FoldRate", metrics["agent_fold_rate"], iteration)
     writer.add_scalar(f"{prefix}/CheckCallRate", metrics["agent_check_call_rate"], iteration)
     writer.add_scalar(f"{prefix}/RaiseRate", metrics["agent_raise_rate"], iteration)
+    writer.add_scalar(
+        f"{prefix}/RaiseHalfPotRate", metrics["agent_raise_half_pot_rate"], iteration
+    )
+    writer.add_scalar(f"{prefix}/RaisePotRate", metrics["agent_raise_pot_rate"], iteration)
+    writer.add_scalar(
+        f"{prefix}/RaiseOverbetRate", metrics["agent_raise_overbet_rate"], iteration
+    )
     writer.add_scalar(f"{prefix}/PreflopFoldRate", metrics["agent_preflop_fold_rate"], iteration)
     writer.add_scalar(f"{prefix}/AgentActions", metrics["agent_actions"], iteration)
     writer.add_scalar(f"{prefix}/SanitizedActions", metrics["sanitized_actions"], iteration)
@@ -101,7 +124,10 @@ def print_evaluation_diagnostics(metrics: Dict[str, Any], label: str):
         f"{label} action mix: "
         f"fold={metrics['agent_fold_rate']:.1%}, "
         f"check-call={metrics['agent_check_call_rate']:.1%}, "
-        f"raise={metrics['agent_raise_rate']:.1%}, "
+        f"raise={metrics['agent_raise_rate']:.1%} "
+        f"(half-pot={metrics['agent_raise_half_pot_rate']:.1%}, "
+        f"pot={metrics['agent_raise_pot_rate']:.1%}, "
+        f"overbet={metrics['agent_raise_overbet_rate']:.1%}), "
         f"preflop_fold={metrics['agent_preflop_fold_rate']:.1%} "
         f"({metrics['agent_preflop_folds']}/{metrics['agent_preflop_actions']})"
     )
@@ -147,6 +173,7 @@ def evaluate_agent_matchup(
     zero_reward_games = 0
     total_actions = 0
     agent_action_counts = {"fold": 0, "check_call": 0, "raise": 0}
+    agent_raise_size_counts = {"half_pot": 0, "pot": 0, "overbet": 0}
     agent_preflop_actions = 0
     agent_preflop_folds = 0
     sanitized_actions = 0
@@ -209,6 +236,9 @@ def evaluate_agent_matchup(
                         agent_action_counts["check_call"] += 1
                     elif action.action == pkrs.ActionEnum.Raise:
                         agent_action_counts["raise"] += 1
+                        agent_raise_size_counts[
+                            classify_raise_size(action.amount, state.pot)
+                        ] += 1
                 else:
                     opponent = opponents[current_player]
                     if opponent is None:
@@ -286,6 +316,13 @@ def evaluate_agent_matchup(
 
     avg_profit = total_profit / completed_games if completed_games else 0.0
     rates = _action_rates(agent_action_counts)
+    agent_actions = sum(agent_action_counts.values())
+    raise_size_rates = {
+        f"agent_raise_{size}_rate": (
+            agent_raise_size_counts[size] / agent_actions if agent_actions else 0.0
+        )
+        for size in ("half_pot", "pot", "overbet")
+    }
     if strict and num_games > 0 and completed_games == 0:
         raise RuntimeError(f"{label} completed zero games")
 
@@ -309,9 +346,15 @@ def evaluate_agent_matchup(
         "agent_fold_actions": agent_action_counts["fold"],
         "agent_check_call_actions": agent_action_counts["check_call"],
         "agent_raise_actions": agent_action_counts["raise"],
+        "agent_raise_half_pot_actions": agent_raise_size_counts["half_pot"],
+        "agent_raise_pot_actions": agent_raise_size_counts["pot"],
+        "agent_raise_overbet_actions": agent_raise_size_counts["overbet"],
         "agent_fold_rate": rates["fold"],
         "agent_check_call_rate": rates["check_call"],
         "agent_raise_rate": rates["raise"],
+        "agent_raise_half_pot_rate": raise_size_rates["agent_raise_half_pot_rate"],
+        "agent_raise_pot_rate": raise_size_rates["agent_raise_pot_rate"],
+        "agent_raise_overbet_rate": raise_size_rates["agent_raise_overbet_rate"],
         "agent_preflop_actions": agent_preflop_actions,
         "agent_preflop_folds": agent_preflop_folds,
         "agent_preflop_fold_rate": preflop_fold_rate,

@@ -18,6 +18,9 @@ def collect_training_diagnostics(
         "strategy_target_fold": 0.0,
         "strategy_target_check_call": 0.0,
         "strategy_target_raise": 0.0,
+        "strategy_target_raise_half_pot": 0.0,
+        "strategy_target_raise_pot": 0.0,
+        "strategy_target_raise_overbet": 0.0,
         "regret_samples": 0,
         "regret_target_min": 0.0,
         "regret_target_mean": 0.0,
@@ -30,12 +33,16 @@ def collect_training_diagnostics(
         rows = strategy_memory[-sample_size:]
         strategies = np.array([row[2] for row in rows], dtype=np.float32)
         target_mean = np.mean(strategies, axis=0)
+        raise_mass = float(np.sum(target_mean[2:]))
         diagnostics.update(
             {
                 "strategy_samples": len(rows),
                 "strategy_target_fold": float(target_mean[0]),
                 "strategy_target_check_call": float(target_mean[1]),
-                "strategy_target_raise": float(target_mean[2]),
+                "strategy_target_raise": raise_mass,
+                "strategy_target_raise_half_pot": float(target_mean[2]),
+                "strategy_target_raise_pot": float(target_mean[3]) if target_mean.shape[0] > 3 else 0.0,
+                "strategy_target_raise_overbet": float(target_mean[4]) if target_mean.shape[0] > 4 else 0.0,
             }
         )
 
@@ -79,6 +86,21 @@ def write_training_diagnostics(writer, diagnostics: Dict[str, Any], iteration: i
         diagnostics["strategy_target_raise"],
         iteration,
     )
+    writer.add_scalar(
+        f"{prefix}/StrategyTargetRaiseHalfPot",
+        diagnostics["strategy_target_raise_half_pot"],
+        iteration,
+    )
+    writer.add_scalar(
+        f"{prefix}/StrategyTargetRaisePot",
+        diagnostics["strategy_target_raise_pot"],
+        iteration,
+    )
+    writer.add_scalar(
+        f"{prefix}/StrategyTargetRaiseOverbet",
+        diagnostics["strategy_target_raise_overbet"],
+        iteration,
+    )
     writer.add_scalar(f"{prefix}/RegretTargetMin", diagnostics["regret_target_min"], iteration)
     writer.add_scalar(f"{prefix}/RegretTargetMean", diagnostics["regret_target_mean"], iteration)
     writer.add_scalar(f"{prefix}/RegretTargetMax", diagnostics["regret_target_max"], iteration)
@@ -92,7 +114,10 @@ def format_training_diagnostics(diagnostics: Dict[str, Any]) -> str:
         "targets "
         f"fold={diagnostics['strategy_target_fold']:.2f}, "
         f"check-call={diagnostics['strategy_target_check_call']:.2f}, "
-        f"raise={diagnostics['strategy_target_raise']:.2f}; "
+        f"raise={diagnostics['strategy_target_raise']:.2f} "
+        f"(half={diagnostics['strategy_target_raise_half_pot']:.2f}, "
+        f"pot={diagnostics['strategy_target_raise_pot']:.2f}, "
+        f"overbet={diagnostics['strategy_target_raise_overbet']:.2f}); "
         "regret "
         f"min={diagnostics['regret_target_min']:.2f}, "
         f"mean={diagnostics['regret_target_mean']:.2f}, "

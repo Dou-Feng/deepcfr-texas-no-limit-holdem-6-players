@@ -47,6 +47,7 @@ def checkpoint_metadata(agent, agent_type: str, **extra):
         "num_players": getattr(agent, "num_players", 6),
         "player_id": getattr(agent, "player_id", 0),
         "iteration": getattr(agent, "iteration_count", 0),
+        "num_actions": getattr(agent, "num_actions", 3),
     }
     metadata.update(extra)
     return metadata
@@ -77,6 +78,8 @@ def standard_checkpoint_state(agent, **extra):
         "strategy_net": agent.strategy_net.state_dict(),
         "min_bet_size": getattr(agent, "min_bet_size", 0.1),
         "max_bet_size": getattr(agent, "max_bet_size", 3.0),
+        "num_actions": getattr(agent, "num_actions", 3),
+        "raise_action_multipliers": getattr(agent, "raise_action_multipliers", None),
     }
     checkpoint.update(extra)
     return attach_checkpoint_metadata(checkpoint, agent, AGENT_TYPE_STANDARD)
@@ -118,6 +121,7 @@ def validate_checkpoint_compatibility(
     *,
     expected_agent_type: str = None,
     expected_num_players: int = None,
+    expected_num_actions: int = None,
 ):
     """Raise a clear error when checkpoint metadata conflicts with expectations."""
     agent_type = infer_agent_type(checkpoint)
@@ -137,4 +141,30 @@ def validate_checkpoint_compatibility(
             f"expected '{expected_num_players}'."
         )
 
+    if expected_num_actions is not None:
+        num_actions = checkpoint_num_actions(checkpoint)
+        if num_actions != expected_num_actions:
+            raise ValueError(
+                f"Checkpoint num_actions '{num_actions}' is not compatible with "
+                f"expected '{expected_num_actions}'."
+            )
+
     return True
+
+
+def checkpoint_num_actions(checkpoint: dict) -> int:
+    """Return the action-abstraction size a checkpoint was trained with.
+
+    Prefers explicit metadata; falls back to the advantage head's output
+    shape so legacy checkpoints without the field are still detected.
+    """
+    for source in (checkpoint, checkpoint.get("metadata") or {}):
+        if isinstance(source, dict) and source.get("num_actions"):
+            return int(source["num_actions"])
+
+    advantage_state = checkpoint.get("advantage_net")
+    if isinstance(advantage_state, dict):
+        weight = advantage_state.get("action_head.weight")
+        if weight is not None and hasattr(weight, "shape"):
+            return int(weight.shape[0])
+    return 3

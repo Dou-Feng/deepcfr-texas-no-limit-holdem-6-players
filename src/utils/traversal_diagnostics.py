@@ -9,7 +9,9 @@ import numpy as np
 ACTION_NAMES = {
     0: "fold",
     1: "check_call",
-    2: "raise",
+    2: "raise_half_pot",
+    3: "raise_pot",
+    4: "raise_overbet",
 }
 
 

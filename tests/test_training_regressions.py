@@ -76,7 +76,7 @@ def assert_replay_memory_shapes(agent, expected_iteration=1):
     state, opponent_features, action_type, bet_size, regret = agent.advantage_memory.buffer[0]
     assert len(state) > 0
     assert opponent_features.shape == (20,)
-    assert action_type in (0, 1, 2)
+    assert 0 <= action_type < agent.num_actions
     assert isinstance(float(bet_size), float)
     assert isinstance(float(regret), float)
 
@@ -304,8 +304,13 @@ def test_continue_training_uses_local_replay_iteration_after_high_resume(tmp_pat
     )
 
     assert agent.iteration_count == 5001
-    assert losses == [0]
+    # With the 5-action abstraction a single traversal can fill the replay
+    # memory past the training batch size, so the advantage network may
+    # either be skipped (loss 0) or trained (loss >= 0).
+    assert len(losses) == 1
+    assert losses[0] >= 0.0
     assert profits[0] == 0.0
+    assert agent.local_training_iteration == 1
     assert_replay_memory_shapes(agent, expected_iteration=1)
 
     saved_checkpoint = torch.load(

@@ -10,6 +10,23 @@ ACTION_TYPE_FOLD = 0
 ACTION_TYPE_CHECK_CALL = 1
 ACTION_TYPE_RAISE = 2
 
+# Discrete raise-sizing abstraction. ACTION_TYPE_RAISE (2) doubles as the
+# half-pot raise so the legacy 3-action abstraction keeps working.
+ACTION_TYPE_RAISE_HALF_POT = 2
+ACTION_TYPE_RAISE_POT = 3
+ACTION_TYPE_RAISE_OVERBET = 4
+
+# Pot multipliers used when a discrete raise action type is selected.
+RAISE_ACTION_MULTIPLIERS = {
+    ACTION_TYPE_RAISE_HALF_POT: 0.5,
+    ACTION_TYPE_RAISE_POT: 1.0,
+    ACTION_TYPE_RAISE_OVERBET: 2.0,
+}
+
+# Action abstraction sizes: legacy continuous sizing (3) vs discrete sizings (5).
+NUM_ACTIONS_CONTINUOUS = 3
+NUM_ACTIONS_DISCRETE = 5
+
 
 class ActionMappingFailure(ValueError):
     """Raised when an action cannot be mapped without falling back."""
@@ -67,8 +84,13 @@ def safe_fallback_action(
     return fallback
 
 
-def legal_action_types(state) -> List[int]:
-    """Map pokers legal actions onto the project action abstraction."""
+def legal_action_types(state, num_actions: int = NUM_ACTIONS_CONTINUOUS) -> List[int]:
+    """Map pokers legal actions onto the project action abstraction.
+
+    With ``num_actions >= NUM_ACTIONS_DISCRETE`` every legal raise expands
+    into half-pot / pot / 2x-pot raise action types so each sizing gets its
+    own CFR regret. The legacy 3-action abstraction is unchanged.
+    """
     action_types = []
     if pkrs.ActionEnum.Fold in state.legal_actions:
         action_types.append(ACTION_TYPE_FOLD)
@@ -76,6 +98,9 @@ def legal_action_types(state) -> List[int]:
         action_types.append(ACTION_TYPE_CHECK_CALL)
     if pkrs.ActionEnum.Raise in state.legal_actions:
         action_types.append(ACTION_TYPE_RAISE)
+        if num_actions >= NUM_ACTIONS_DISCRETE:
+            action_types.append(ACTION_TYPE_RAISE_POT)
+            action_types.append(ACTION_TYPE_RAISE_OVERBET)
     return action_types
 
 
@@ -283,9 +308,9 @@ def action_type_to_pokers_action(
             fallback_recorder=fallback_recorder,
         )
 
-    if action_type == ACTION_TYPE_RAISE:
+    if action_type in RAISE_ACTION_MULTIPLIERS:
         if bet_size_multiplier is None:
-            bet_size_multiplier = 1.0
+            bet_size_multiplier = RAISE_ACTION_MULTIPLIERS[action_type]
         bet_size_multiplier = max(min_bet_size, min(max_bet_size, float(bet_size_multiplier)))
         desired_additional_raise = max(1.0, float(state.pot)) * bet_size_multiplier
         return build_raise_action(
