@@ -25,6 +25,7 @@ Field conventions (all in pokers numbering, matching training):
 """
 
 import argparse
+import threading
 import time
 from types import SimpleNamespace
 from typing import Dict, List, Optional
@@ -37,7 +38,6 @@ from pydantic import BaseModel, Field
 
 import pokers as pkrs
 
-from src.core.deep_cfr import DeepCFRAgent
 from src.core.model import encode_state
 from src.utils.actions import (
     ACTION_TYPE_FOLD,
@@ -46,6 +46,7 @@ from src.utils.actions import (
     legal_action_types,
     raise_bounds,
 )
+from src.utils.agents import create_agent_for_checkpoint
 
 SUIT_CLUBS, SUIT_DIAMONDS, SUIT_HEARTS, SUIT_SPADES = 0, 1, 2, 3
 
@@ -72,6 +73,16 @@ class PlayerSlot(BaseModel):
     stake: float = 0.0
 
 
+class OpponentAction(BaseModel):
+    action_id: int = Field(ge=0, le=4)
+    context: List[float] = Field(min_length=25, max_length=25)
+
+
+class OpponentHistory(BaseModel):
+    opponent_id: int = Field(ge=0, le=5)
+    actions: List[OpponentAction] = Field(default_factory=list)
+
+
 class ActionRequest(BaseModel):
     player_id: int = Field(ge=0, le=5)
     hand: List[List[int]] = Field(default_factory=list)
@@ -85,6 +96,7 @@ class ActionRequest(BaseModel):
     current_player: int = Field(ge=0, le=5, default=0)
     players: List[PlayerSlot] = Field(default_factory=list)
     legal_actions: List[str] = Field(default_factory=list)
+    opponent_histories: List[OpponentHistory] = Field(default_factory=list)
     sample: bool = True
 
 
@@ -161,10 +173,60 @@ def _pseudo_state(req: ActionRequest) -> SimpleNamespace:
     )
 
 
+def _load_opponent_histories(agent, player_id: int, histories: List[OpponentHistory]):
+    """Replay one request's current-hand observations into an OM agent.
+
+    Runtime histories are request-scoped: the HTTP process may serve several
+    go-poker rooms, so retaining one table's opponents in the singleton agent
+    would contaminate another table. Standard checkpoints simply return no
+    opponent features and remain wire-compatible with the extended request.
+    """
+    if not hasattr(agent, "record_opponent_action"):
+        return None
+
+    agent.player_id = player_id
+    agent.current_game_history = {}
+    agent.opponent_modeling.opponent_histories = {}
+
+    for opponent in histories:
+        if opponent.opponent_id == player_id:
+            raise HTTPException(
+                status_code=422,
+                detail="opponent history cannot belong to the acting player",
+            )
+        for item in opponent.actions:
+            agent.record_opponent_action(
+                state=None,
+                action_id=item.action_id,
+                opponent_id=opponent.opponent_id,
+                state_context=np.asarray(item.context, dtype=np.float32),
+            )
+
+    # The OM encoder reads completed sequences from opponent_histories. A
+    # prefix of the current hand is a complete observation for this request;
+    # outcome is unused by inference-time feature extraction.
+    for opponent_id, history in agent.current_game_history.items():
+        if not history["actions"]:
+            continue
+        agent.opponent_modeling.record_game(
+            opponent_id=opponent_id,
+            action_sequence=history["actions"],
+            state_contexts=history["contexts"],
+            outcome=0.0,
+        )
+    agent.current_game_history = {}
+    return agent.get_table_opponent_features()
+
+
 def create_app(checkpoint_path: str, device: str = "cpu") -> FastAPI:
-    agent = DeepCFRAgent(player_id=0, num_players=6, device=device)
-    agent.load_model(checkpoint_path)
+    agent = create_agent_for_checkpoint(checkpoint_path, player_id=0, device=device)
     agent.strategy_net.eval()
+    if hasattr(agent, "opponent_modeling"):
+        agent.opponent_modeling.history_encoder.eval()
+        agent.opponent_modeling.opponent_model.eval()
+
+    # agent.player_id and the OM runtime buffers are set per request.
+    inference_lock = threading.Lock()
 
     app = FastAPI(title="deepcfr inference", version="1")
 
@@ -175,6 +237,7 @@ def create_app(checkpoint_path: str, device: str = "cpu") -> FastAPI:
             "checkpoint": checkpoint_path,
             "iteration": agent.iteration_count,
             "num_actions": agent.num_actions,
+            "agent_type": type(agent).__name__,
         }
 
     @app.post("/v1/act", response_model=ActionResponse)
@@ -191,10 +254,20 @@ def create_app(checkpoint_path: str, device: str = "cpu") -> FastAPI:
         if not legal_types:
             raise HTTPException(status_code=422, detail="no legal actions provided")
 
-        with torch.no_grad():
+        with inference_lock, torch.no_grad():
+            agent.player_id = req.player_id
+            opponent_features = _load_opponent_histories(
+                agent, req.player_id, req.opponent_histories
+            )
             encoded = encode_state(state, req.player_id)
             tensor = torch.FloatTensor(encoded).unsqueeze(0).to(agent.device)
-            logits, _ = agent.strategy_net(tensor)
+            if opponent_features is None:
+                logits, _ = agent.strategy_net(tensor)
+            else:
+                opponent_tensor = (
+                    torch.FloatTensor(opponent_features).unsqueeze(0).to(agent.device)
+                )
+                logits, _ = agent.strategy_net(tensor, opponent_tensor)
             probs = F.softmax(logits, dim=1)[0].cpu().numpy()
 
         legal_probs = np.array([probs[a] for a in legal_types])

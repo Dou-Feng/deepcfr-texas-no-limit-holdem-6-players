@@ -93,6 +93,8 @@ def opponent_modeling_checkpoint_state(agent, **extra):
         "strategy_net": agent.strategy_net.state_dict(),
         "history_encoder": agent.opponent_modeling.history_encoder.state_dict(),
         "opponent_model": agent.opponent_modeling.opponent_model.state_dict(),
+        "num_actions": getattr(agent, "num_actions", 3),
+        "raise_action_multipliers": getattr(agent, "raise_action_multipliers", None),
     }
     checkpoint.update(extra)
     return attach_checkpoint_metadata(checkpoint, agent, AGENT_TYPE_OPPONENT_MODELING)

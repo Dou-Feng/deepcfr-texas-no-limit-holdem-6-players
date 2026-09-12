@@ -19,7 +19,8 @@ go-poker (Go)                        本仓库 (Python)
   解析响应并映射回 `botAction{kind, amount}`。`bot.go` 的决策入口改为
   `decideBotAction`：AI 可用走模型，出错自动回退启发式。
 - **Python 侧**（`server/inference_server.py`）：FastAPI 服务。内部用 duck-typed
-  伪 state **原样复用**训练期的 `encode_state` / 加注钳制逻辑，保证特征一致性。
+  伪 state **原样复用**训练期的 `encode_state` / 加注钳制逻辑，保证特征一致性；
+  `create_agent_for_checkpoint` 自动选择普通或 OM agent，OM 请求会先重放对手动作历史。
 
 ## 启动
 
@@ -56,6 +57,24 @@ AI_INFERENCE_URL=http://127.0.0.1:8001 ./go-poker
 
 响应动作用 **go-poker 语义**：`raise` 的 `amount = call_amount + 加注额`，
 即 `Bet(pn, amount)` 一次调用即可；引擎自身仍做最终合法性校验。
+
+OM checkpoint 的请求还可携带当前手牌中各对手的动作序列：
+
+```json
+{
+  "opponent_histories": [
+    {
+      "opponent_id": 1,
+      "actions": [
+        {"action_id": 3, "context": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}
+      ]
+    }
+  ]
+}
+```
+
+`action_id` 为 0=fold、1=check/call、2=half-pot、3=pot、4=overbet；
+`context` 必须恰好 25 维。历史只在单次请求内使用，不会跨房间残留。
 
 ## 注意事项与限制
 

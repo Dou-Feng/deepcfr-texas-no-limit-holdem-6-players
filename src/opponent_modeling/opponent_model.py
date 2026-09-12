@@ -108,6 +108,17 @@ class OpponentModelingSystem:
         # Optimizer
         params = list(self.history_encoder.parameters()) + list(self.opponent_model.parameters())
         self.optimizer = torch.optim.Adam(params, lr=0.001)
+        
+        # Feature cache: opponent features are expensive (GRU over the full
+        # history) but only change when histories are recorded or the OM
+        # weights are trained/loaded. Traversals re-query the same frozen
+        # histories at every agent node, so caching removes nearly all
+        # encoder forward passes. See invalidate_cache().
+        self._feature_cache = {}
+    
+    def invalidate_cache(self):
+        """Drop cached opponent features (after any history/weight mutation)."""
+        self._feature_cache = {}
     
     def record_game(self, opponent_id, action_sequence, state_contexts, outcome):
         """
@@ -123,6 +134,7 @@ class OpponentModelingSystem:
             self.opponent_histories[opponent_id] = deque(maxlen=self.max_history)
         
         self.opponent_histories[opponent_id].append((action_sequence, state_contexts, outcome))
+        self.invalidate_cache()
     
     def get_opponent_encoding(self, opponent_id):
         """
@@ -168,13 +180,20 @@ class OpponentModelingSystem:
     def get_opponent_features(self, opponent_id):
         """
         Get predicted features/tendencies for an opponent.
+        Served from cache unless histories or weights changed since the last call.
         """
+        cached = self._feature_cache.get(opponent_id)
+        if cached is not None:
+            return cached
+        
         encoding = self.get_opponent_encoding(opponent_id)
         
         with torch.no_grad():
             features = self.opponent_model(encoding.unsqueeze(0)).squeeze(0)
         
-        return features.cpu().numpy()
+        features = features.cpu().numpy()
+        self._feature_cache[opponent_id] = features
+        return features
     
     def train(self, batch_size=32, epochs=1):
         """
@@ -236,6 +255,7 @@ class OpponentModelingSystem:
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+            self.invalidate_cache()  # encoder/model weights changed
             
             total_loss += loss.item()
         

@@ -21,13 +21,18 @@ def classify_raise_size(amount: float, pot: float) -> str:
 
 
 def action_history_id(action: pkrs.Action, pot: float) -> int:
-    """Map a pokers action to the compact opponent-modeling history id."""
+    """Map a pokers action to the compact opponent-modeling history id.
+
+    Buckets mirror the 5-action CFR abstraction: 0 fold, 1 check/call,
+    2 half-pot, 3 pot, 4 overbet raise.
+    """
     if action.action == pkrs.ActionEnum.Fold:
         return 0
     if action.action in (pkrs.ActionEnum.Check, pkrs.ActionEnum.Call):
         return 1
     if action.action == pkrs.ActionEnum.Raise:
-        return 2 if action.amount <= pot * 0.75 else 3
+        bucket = classify_raise_size(action.amount, pot)
+        return {"half_pot": 2, "pot": 3, "overbet": 4}[bucket]
     return 1
 
 

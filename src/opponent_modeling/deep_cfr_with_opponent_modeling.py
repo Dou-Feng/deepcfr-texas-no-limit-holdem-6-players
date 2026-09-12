@@ -19,8 +19,13 @@ from src.core.deep_cfr import (
     weighted_sample_loss,
     weighted_strategy_cross_entropy,
 )
+from src.utils.actions import (
+    NUM_ACTIONS_DISCRETE,
+    RAISE_ACTION_MULTIPLIERS,
+)
 from src.utils.checkpoints import (
     AGENT_TYPE_OPPONENT_MODELING,
+    checkpoint_num_actions,
     load_checkpoint,
     opponent_modeling_checkpoint_state,
     validate_checkpoint_compatibility,
@@ -99,8 +104,10 @@ class DeepCFRAgentWithOpponentModeling:
         self.num_players = num_players
         self.device = device
         
-        # Define action types (Fold, Check/Call, Raise)
-        self.num_actions = 3
+        # Define action types (Fold, Check/Call, Raise-half-pot, Raise-pot, Raise-overbet)
+        self.num_actions = NUM_ACTIONS_DISCRETE
+        # Fixed pot multipliers for the discrete raise action types.
+        self.raise_action_multipliers = dict(RAISE_ACTION_MULTIPLIERS)
         
         # Calculate input size based on state encoding
         input_size = 52 + 52 + 5 + 1 + num_players + num_players + num_players*4 + 1 + 4 + 5
@@ -132,7 +139,7 @@ class DeepCFRAgentWithOpponentModeling:
         # Initialize opponent modeling system with enhanced features
         self.opponent_modeling = OpponentModelingSystem(
             max_history_per_opponent=20,
-            action_dim=4,  # Still tracking 4 discrete actions for history
+            action_dim=self.num_actions,  # fold / check-call / half-pot / pot / overbet
             state_dim=25,  # Expanded to include bet sizing features
             device=device
         )
@@ -218,9 +225,15 @@ class DeepCFRAgentWithOpponentModeling:
         
         return context
     
-    def record_opponent_action(self, state, action_id, opponent_id):
+    def record_opponent_action(
+        self, state, action_id, opponent_id, state_context=None
+    ):
         """
         Record an action taken by an opponent for later opponent modeling.
+
+        HTTP inference callers may provide the already-extracted 25-value
+        context. Training callers continue to pass a pokers state and use the
+        same extraction path as before.
         """
         # Initialize history for this opponent if needed
         if opponent_id not in self.current_game_history:
@@ -229,12 +242,23 @@ class DeepCFRAgentWithOpponentModeling:
                 'contexts': []
             }
         
-        # Convert action to one-hot encoding
-        action_encoded = np.zeros(4)  # Use original 4 action encoding for history
+        # Convert action to one-hot encoding (5 buckets: fold / check-call /
+        # half-pot / pot / overbet, matching the CFR action abstraction)
+        action_encoded = np.zeros(self.opponent_modeling.action_dim)
         action_encoded[action_id] = 1
         
-        # Get state context
-        context = self.extract_state_context(state)
+        # Get state context. A precomputed context lets external engines report
+        # the exact state that preceded an action without reconstructing a
+        # historical pokers.State object.
+        if state_context is None:
+            context = self.extract_state_context(state)
+        else:
+            context = np.asarray(state_context, dtype=np.float32)
+            expected_shape = (self.opponent_modeling.state_dim,)
+            if context.shape != expected_shape:
+                raise ValueError(
+                    f"state_context must have shape {expected_shape}, got {context.shape}"
+                )
         
         # Record action and context
         self.current_game_history[opponent_id]['actions'].append(action_encoded)
@@ -363,11 +387,14 @@ class DeepCFRAgentWithOpponentModeling:
                 elif action.action == pkrs.ActionEnum.Check or action.action == pkrs.ActionEnum.Call:
                     action_id = 1
                 elif action.action == pkrs.ActionEnum.Raise:
-                    # Determine which raise size it's closest to
-                    if action.amount <= state.pot * 0.75:
-                        action_id = 2  # 0.5x pot raise
+                    # Bucket the raise into the discrete sizings
+                    ratio = float(action.amount) / max(1.0, float(state.pot))
+                    if ratio <= 0.75:
+                        action_id = 2  # half-pot raise
+                    elif ratio <= 1.5:
+                        action_id = 3  # pot raise
                     else:
-                        action_id = 3  # 1x pot raise
+                        action_id = 4  # overbet (2x pot)
                 else:
                     action_id = 1  # Default to call if unrecognized
                 
@@ -447,8 +474,8 @@ class DeepCFRAgentWithOpponentModeling:
             action_loss = F.smooth_l1_loss(predicted_regrets, regret_tensors, reduction='none')
             weighted_action_loss = (action_loss * weight_tensors).mean()
             
-            # Compute bet sizing loss (only for raise actions)
-            raise_mask = (action_type_tensors == 2)
+            # Compute bet sizing loss (only for raise actions, types 2/3/4)
+            raise_mask = (action_type_tensors >= 2)
             if raise_mask.sum() > 0:
                 raise_indices = torch.nonzero(raise_mask).squeeze(1)
                 raise_bet_preds = bet_size_preds[raise_indices]
@@ -524,8 +551,8 @@ class DeepCFRAgentWithOpponentModeling:
                 weights,
             )
             
-            # Bet size loss (only for states with raise actions)
-            raise_mask = (strategy_tensors[:, 2] > 0)
+            # Bet size loss (only for states where some raise action was legal)
+            raise_mask = (strategy_tensors[:, 2:].sum(dim=1) > 0)
             if raise_mask.sum() > 0:
                 raise_indices = torch.nonzero(raise_mask).squeeze(1)
                 raise_bet_preds = bet_size_preds[raise_indices]
@@ -602,12 +629,12 @@ class DeepCFRAgentWithOpponentModeling:
         action_idx = np.random.choice(len(legal_action_types), p=legal_probs)
         action_type = legal_action_types[action_idx]
         
-        # Use the predicted bet size for raise actions
-        if action_type == 2:  # Raise
+        # Discrete raise action types carry fixed pot multipliers
+        if action_type in self.raise_action_multipliers:
             return self.action_type_to_pokers_action(
                 action_type,
                 state,
-                bet_size_multiplier,
+                self.raise_action_multipliers[action_type],
                 strict=settings.is_strict_checking(),
             )
         else:
@@ -629,6 +656,7 @@ class DeepCFRAgentWithOpponentModeling:
             checkpoint,
             expected_agent_type=AGENT_TYPE_OPPONENT_MODELING,
             expected_num_players=self.num_players,
+            expected_num_actions=self.num_actions,
         )
         self.iteration_count = checkpoint['iteration']
         self.advantage_net.load_state_dict(checkpoint['advantage_net'])
@@ -638,3 +666,4 @@ class DeepCFRAgentWithOpponentModeling:
         if 'history_encoder' in checkpoint and 'opponent_model' in checkpoint:
             self.opponent_modeling.history_encoder.load_state_dict(checkpoint['history_encoder'])
             self.opponent_modeling.opponent_model.load_state_dict(checkpoint['opponent_model'])
+            self.opponent_modeling.invalidate_cache()  # encoder weights changed
