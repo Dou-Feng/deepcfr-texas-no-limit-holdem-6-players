@@ -12,3 +12,8 @@ requests==2.32.3
 seaborn==0.13.2
 pandas>=2.3.3,<3.0
 PyQt5==5.15.11
+
+# HTTP inference server for go-poker (server/inference_server.py)
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
